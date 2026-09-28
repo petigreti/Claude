@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Weigh It Up</title>
+<meta name="description" content="A weighted decision matrix: score options against criteria and see them ranked.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+<div class="page">
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12 4v16M8 20h8M5 7h14"/>
+        <path d="M5 7 2.5 13.5h5z M2.5 13.5a2.5 2.5 0 0 0 5 0"/>
+        <path d="M19 7l-2.5 6.5h5z M16.5 13.5a2.5 2.5 0 0 0 5 0"/>
+      </svg>
+      <span>Weigh It Up</span>
+    </div>
+    <div class="actions">
+      <button type="button" class="btn" id="load-example">Load example</button>
+      <button type="button" class="btn" id="start-blank">Start blank</button>
+    </div>
+  </header>
+
+  <section class="decision">
+    <label class="eyebrow" for="decision-title">Decision matrix</label>
+    <textarea class="title-input" id="decision-title" rows="1" maxlength="120" autocomplete="off" placeholder="What are you deciding?"></textarea>
+    <p class="how">Put your options across the top and the criteria you care about down the side. Weight each criterion from 1 to 5, score every option from 0 to 10, and the totals and ranking update as you type.</p>
+    <p class="example-note" id="example-note" hidden>
+      <span class="chip">Example</span>
+      <span>Sample data to show how it works. Edit anything, or <button type="button" class="link-btn" id="example-start-blank">start blank</button>.</span>
+    </p>
+  </section>
+
+  <main class="workspace">
+    <section class="ranking" aria-labelledby="ranking-heading">
+      <h2 class="panel-label" id="ranking-heading">Ranking</h2>
+      <p class="verdict" id="verdict"></p>
+      <p class="verdict-note" id="verdict-note" hidden></p>
+      <ol class="rank-list" id="rank-list"></ol>
+      <p class="formula" id="formula"></p>
+    </section>
+
+    <section class="matrix-panel" aria-labelledby="matrix-heading">
+      <div class="panel-bar">
+        <h2 class="panel-label" id="matrix-heading">Matrix</h2>
+        <button type="button" class="add-btn bar-add" id="add-option-bar" data-action="add-option">
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/></svg>
+          Add option
+        </button>
+        <p class="scale-key">
+          <span><b>Score</b> 0–10, higher is better</span>
+          <span><b>Weight</b> 1–5, higher matters more</span>
+        </p>
+      </div>
+      <div class="matrix-scroll">
+        <table class="matrix" id="matrix"></table>
+      </div>
+    </section>
+  </main>
+
+  <p class="footnote" id="storage-note"></p>
+</div>
+
+<div class="toast" id="toast" hidden>
+  <span id="toast-text"></span>
+  <button type="button" class="toast-undo" id="toast-undo">Undo</button>
+</div>
+<div class="sr-only" id="announcer" aria-live="polite"></div>
+
+<script src="js/matrix.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

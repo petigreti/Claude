@@ -1,0 +1,10 @@
+{
+  "name": "weigh-it-up",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A weighted decision matrix that runs in the browser: options as columns, criteria as rows, ranked totals.",
+  "scripts": {
+    "start": "npx --yes serve .",
+    "test": "node --test"
+  }
+}
