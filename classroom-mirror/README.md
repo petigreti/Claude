@@ -32,22 +32,66 @@ Classroom Mirror/
 ## Design decisions
 
 **Scopes (`drive.readonly` + `drive.file`, not full `drive`).**
-- `drive.readonly` lets the script read the professors' files.
-- `drive.file` lets it create and modify only the files and folders it created
-  itself.
-- The script never writes to anything it didn't create. It finds its own folders
-  and files by hidden tags (Drive `appProperties`), not by name, which is what
-  makes `drive.file` enough.
+- The script reads through Drive with `drive.readonly`. `DriveApp` is used only
+  for reads: `getFileById`, `getAs`, `getBlob`, `isTrashed`.
+- Every write goes through the Drive API v3 advanced service (`Drive.Files.create`,
+  `copy`, `update`) under `drive.file`. That scope lets the script change only the
+  files and folders it created itself.
+- The script finds its own folders and files by hidden tags (`appProperties`), not
+  by name.
+- There are no `DriveApp` write calls anywhere (`createFolder`, `createFile`,
+  `makeCopy`, `setContent`, `setTrashed`, `moveTo`), and nothing is ever trashed or
+  deleted.
+- Because `drive.file` is enforced by Google's servers, even a bug in the script
+  can't modify files it didn't create.
 
-**Caveat:** if the first run fails with *"Required permissions:
-https://www.googleapis.com/auth/drive"*, then in `appsscript.json` replace the two
-`drive.readonly` / `drive.file` lines with `"https://www.googleapis.com/auth/drive"`,
-save, and authorize again. Nothing else needs to change.
+| Scope | Needed for |
+|---|---|
+| `classroom.courses.readonly` | `Classroom.Courses.list` / `.get`: `listActiveCourses_`, `courseCtx_` |
+| `classroom.courseworkmaterials.readonly` | `Classroom.Courses.CourseWorkMaterials.list`: `listStream_` |
+| `classroom.coursework.me.readonly` | `Classroom.Courses.CourseWork.list`: `listStream_` |
+| `classroom.announcements.readonly` | `Classroom.Courses.Announcements.list`: `listStream_` |
+| `classroom.topics.readonly` | `Classroom.Courses.Topics.list`: `topicName_` |
+| `drive.readonly` | `Drive.Files.get` (`getMetaOrNull_`), `Drive.Files.list` (`listFiles_`), `DriveApp.getFileById().getAs/getBlob/isTrashed` (`exportPdf_`, `copyBinary_` fallback, `readText_`) |
+| `drive.file` | `Drive.Files.create` (folders, copies, PDFs, `links.md`, `state.json`, the log), `Drive.Files.update` (rewriting those three text files), `Drive.Files.copy` (`copyBinary_`) |
+| `script.scriptapp` | `ScriptApp.newTrigger` / `getProjectTriggers` / `deleteTrigger`: `setup`, `removeTriggers`, continuation triggers |
+| *(no scope)* | `PropertiesService`, `LockService`, `Utilities`, `Session`, `console` |
 
-**No unofficial export fallback.** PDF export uses `DriveApp…getAs('application/pdf')`,
-a documented Apps Script method. If a file is too large or complex to export, the
-script logs it and puts a link in `links.md`. It never scrapes export URLs, so
-`script.external_request` isn't requested.
+**Caveats:**
+- `Drive.Files.copy` with this scope pair can't be confirmed until you run it. If
+  Google refuses the copy, `copyBinary_` downloads the file (read) and uploads it
+  (create) instead. That fallback works for files up to Apps Script's ~50 MB blob
+  limit.
+- If authorization fails with *"Required permissions:
+  https://www.googleapis.com/auth/drive"*, replace the `drive.readonly` and
+  `drive.file` lines with `"https://www.googleapis.com/auth/drive"` and authorize
+  again.
+
+**PDF export: one path.**
+- `exportPdf_()` is the only code that converts Docs, Sheets, Slides and Drawings.
+  It calls `DriveApp.getFileById(id).getAs('application/pdf')`, a documented Apps
+  Script conversion, then uploads the result with `Drive.Files.create`.
+- No export URLs are used, and `script.external_request` isn't requested.
+- **Conversions count toward Apps Script's daily conversion quota** (see Google's
+  *Quotas for Google Services* page for the current number). When the quota is used
+  up, the script stops converting for that run, logs one warning, and exports the
+  rest on a later pass.
+- Any other export failure (file too large or complex, server error) is logged, and
+  the file is linked in `links.md`.
+
+**Retry rules: nothing is marked done unless a copy was actually created.**
+- A file is recorded as mirrored only after its copy exists. Every problem is
+  re-checked on the next hourly pass: no access, owner disabled downloads, export
+  failed, copy failed, API error, quota reached.
+- A skip is *logged* only once, but it's still *retried* every pass.
+- Attachments that can never become a file (YouTube, links, Forms, Drive folders,
+  Sites) go to `links.md` instead.
+- One temporary exception: if Apps Script kills the run **twice in a row while
+  copying the same file**, that file is skipped for 7 days, or until the file
+  changes, whichever comes first. Kills at different files, or ordinary errors,
+  never skip a file.
+- Dying twice at the same spot *outside* a copy only abandons that pass. The next
+  hourly pass starts over.
 
 **No duplicates, even after a crash.**
 - Each copy is tagged with its source file ID and source revision.
@@ -62,8 +106,10 @@ script logs it and puts a link in `links.md`. It never scrapes export URLs, so
   run a minute later.
 - A script lock stops the hourly run and a continuation from ever running at the
   same time.
-- Every run first deletes old continuation triggers, so there is never more than
-  one.
+- Every run first deletes old continuation triggers of its own kind, matched by
+  handler name, so there is never more than one. This cleanup never touches the
+  hourly `mirrorClassroom` trigger. Only `setup` (which replaces it) and
+  `removeTriggers` do.
 - Every run also arms a safety continuation. If Apps Script kills a run anyway,
   the next run notices and retries. If the same file kills the run twice, that
   file is skipped from then on and linked in `links.md`.
@@ -80,8 +126,8 @@ script logs it and puts a link in `links.md`. It never scrapes export URLs, so
 
 ### 2. Paste the two files
 1. In the editor, open `appsscript.json` and replace its contents with this repo's
-   `appsscript.json`. **Change `"timeZone"`** to your own, e.g. `"Europe/Rome"`. It
-   controls the dates in filenames and in `links.md`.
+   `appsscript.json`. It's set to `"Europe/Prague"`, which controls the dates in
+   filenames and in `links.md`.
 2. Open `Code.gs` and replace its contents with this repo's `Code.gs`.
 3. Save (⌘S).
 
@@ -107,8 +153,13 @@ should see **Classroom** and **Drive**. If either is missing, click **+** and ad
 1. Copy one course ID from the log. Paste it at the top of `Code.gs`:
    `TEST_COURSE_ID: '612345678901',` and save.
 2. Run **`testOneCourse`**. For a big course, the log may end with *"continuing in
-   about a minute"*. The script finishes on its own; run **`showStatus`** to watch
-   progress.
+   about a minute"*. The script finishes on its own through a separate
+   `continueTestCourse` trigger; run **`showStatus`** to watch progress.
+   - The test never installs the hourly trigger. It has its own saved position, so
+     it never disturbs a full pass that's in progress.
+   - It shares `state.json` and the tags with the full mirror on purpose: files it
+     copies are real, and the full pass recognises them instead of copying them
+     again.
 3. Check in Drive (<https://drive.google.com>) that you have:
    - `Classroom Mirror/<Course>/…` with topic folders, PDFs, and `links.md`
    - `Classroom Mirror/_meta/mirror-log.csv` listing each copy, link and skip
@@ -127,9 +178,9 @@ should see **Classroom** and **Drive**. If either is missing, click **+** and ad
 | Run | Does |
 |---|---|
 | `showStatus` | Shows the last completed pass, current progress, and active triggers |
-| `removeTriggers` | Stops everything: deletes the hourly and continuation triggers |
+| `removeTriggers` | Stops everything: deletes the hourly trigger and both kinds of continuation trigger |
 | `setup` | Turns it back on |
-| `resetState` | Clears `state.json`. Existing copies are recognised by their tags, so nothing is duplicated. Use it if the state looks wrong, or to retry files that were skipped for timing out. |
+| `resetState` | Clears `state.json`. Existing copies are recognised by their tags, so nothing is duplicated. Use it if the state looks wrong, or to retry a timed-out file before its 7 days are up. |
 
 ---
 
@@ -171,6 +222,9 @@ needed for this.
 - **Storage:** the copies count toward your university Drive quota.
 - **Log size:** `mirror-log.csv` keeps the latest 5,000 rows.
 - **Wrong dates:** change `timeZone` in `appsscript.json`.
+- **Quotas:** Apps Script limits daily file conversions and total trigger runtime.
+  Hourly passes use a tiny share of both. Only the first backfill is heavy, and it
+  spreads over several runs if needed.
 
 ### Troubleshooting
 | Symptom | Fix |

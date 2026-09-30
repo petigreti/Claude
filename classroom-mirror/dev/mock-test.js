@@ -268,8 +268,9 @@ test('killed run (no clean exit) resumes without duplicates and skips a file tha
   // later ctx.log call throw, so no catch/finally cleanup in run_ gets to save anything.
   const realFormat = w.g.Utilities.formatDate;
   w.g.Utilities.formatDate = function () { if (w.dying) throw { killed: true }; return realFormat.apply(null, arguments); };
+  const realProcess = w.g.processDriveFile_;
   w.g.processDriveFile_ = ((orig) => function (ctx, cc, info, df) {
-    if (df.id === 'BIG' && !ctx.state.poison.BIG) { w.props.INFLIGHT_FILE_ID = 'BIG'; w.dying = true; throw { killed: true }; }
+    if (df.id === 'BIG' && !ctx.state.poison.BIG) { w.props.INFLIGHT_FULL = 'BIG|' + w.files.BIG.modifiedTime; w.dying = true; throw { killed: true }; }
     return orig.apply(this, arguments);
   })(w.g.processDriveFile_);
   let kills = 0;
@@ -282,7 +283,78 @@ test('killed run (no clean exit) resumes without duplicates and skips a file tha
   assert.strictEqual(kills, 2, 'should give up on BIG after 2 kills');
   assert.strictEqual(copies(w).length, 49);
   assert(byName(w, 'links.md').content.includes('Huge deck'));
-  assert(/Skipped: copying it repeatedly exceeded/.test(byName(w, 'mirror-log.csv').content));
+  assert(/Temporarily skipped/.test(byName(w, 'mirror-log.csv').content));
+  // The skip is temporary: after it expires, the file is tried again.
+  w.g.processDriveFile_ = realProcess;
+  tick(8 * 86400000);
+  drain(w);
+  assert(copies(w).some((f) => f.name === 'Huge deck.pdf'), 'BIG retried after expiry');
+});
+
+test('kills at different files never skip a file', () => {
+  const w = makeWorld(); seed(w);
+  const realFormat = w.g.Utilities.formatDate;
+  w.g.Utilities.formatDate = function () { if (w.dying) throw { killed: true }; return realFormat.apply(null, arguments); };
+  const killOnce = new Set(['DOC', 'PDF', 'f1', 'f2']); // each dies exactly once, like a slow server moment
+  const realProcess = w.g.processDriveFile_;
+  w.g.processDriveFile_ = function (ctx, cc, info, df) {
+    if (killOnce.has(df.id)) { killOnce.delete(df.id); w.props.INFLIGHT_FULL = df.id + '|r'; w.dying = true; throw { killed: true }; }
+    return realProcess.apply(this, arguments);
+  };
+  const killRun = (fn) => { try { w.g[fn](); } catch (e) { if (!(e && e.killed)) throw e; w.dying = false; } };
+  killRun('mirrorClassroom');
+  let n = 0;
+  while (w.props.CRAWL && n++ < 50) { tick(480000); killRun('continueMirror'); }
+  assert.strictEqual(Object.keys(JSON.parse(byName(w, 'state.json').content).poison).length, 0);
+  assert.strictEqual(copies(w).length, 49);
+});
+
+test('continuation cleanup never removes the hourly trigger', () => {
+  const w = makeWorld(); seed(w);
+  w.g.setup();
+  w.g.CONFIG.MAX_RUN_MS = 3000;
+  w.g.mirrorClassroom();
+  while (w.props.CRAWL) {
+    assert.strictEqual(w.triggers.filter((t) => t.getHandlerFunction() === 'mirrorClassroom').length, 1);
+    tick(60000); w.g.continueMirror();
+  }
+  assert.deepStrictEqual(w.triggers.map((t) => t.getHandlerFunction()), ['mirrorClassroom']);
+});
+
+test('testOneCourse is isolated from a full pass in progress', () => {
+  const w = makeWorld(); seed(w);
+  w.g.CONFIG.MAX_RUN_MS = 3000;
+  w.g.mirrorClassroom(); // full pass now in progress, with its continuation trigger
+  const fullCursor = w.props.CRAWL;
+  assert(fullCursor);
+  w.g.CONFIG.MAX_RUN_MS = 270000;
+  w.g.CONFIG.TEST_COURSE_ID = 'C2';
+  w.g.testOneCourse();
+  assert.strictEqual(w.props.CRAWL, fullCursor, 'full cursor untouched');
+  assert(!w.props.TEST_CRAWL, 'test pass finished');
+  const handlers = w.triggers.map((t) => t.getHandlerFunction());
+  assert.deepStrictEqual(handlers, ['continueMirror'], 'full continuation kept, no hourly trigger added');
+  // The full pass then finishes without duplicating the test's copies.
+  while (w.props.CRAWL) { tick(60000); w.g.continueMirror(); }
+  assert.strictEqual(copies(w).length, 49);
+});
+
+test('daily conversion quota: exports wait, nothing is marked done, later pass succeeds', () => {
+  const w = makeWorld(); seed(w);
+  const orig = w.g.DriveApp.getFileById;
+  let quota = true;
+  w.g.DriveApp.getFileById = (id) => {
+    const f = orig(id);
+    const getAs = f.getAs;
+    f.getAs = (m) => { if (quota) throw new Error('Service invoked too many times for one day: docs convert.'); return getAs(m); };
+    return f;
+  };
+  drain(w);
+  assert.strictEqual(copies(w).filter((f) => f.mimeType === 'application/pdf' && /Lecture/.test(f.name)).length, 0);
+  assert(!/PDF export failed/.test(byName(w, 'mirror-log.csv').content));
+  quota = false;
+  drain(w);
+  assert.strictEqual(copies(w).filter((f) => /Lecture 1\.pdf/.test(f.name)).length, 2);
 });
 
 test('copy refused -> download+upload fallback; unreadable export -> link', () => {

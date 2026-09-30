@@ -44,16 +44,19 @@ const CONFIG = {
   PAGE_SIZE: 20,                     // Classroom posts per API page
   LOG_MAX_ROWS: 5000,
   MAX_NAME_LENGTH: 120,
-  MAX_HARD_KILLS: 2,                 // killed runs in a row on one file before skipping it
+  MAX_HARD_KILLS: 2,                 // killed runs in a row at the same file before skipping it
+  KILL_SKIP_DAYS: 7,                 // ...for this long (or until the file changes)
   MAX_FAILED_RUNS: 3,                // crashed runs in a row before a pass is abandoned
 };
 
 const HANDLER_HOURLY = 'mirrorClassroom';
-const HANDLER_CONTINUE = 'continueMirror';
+// Each kind of pass has its own saved cursor and its own continuation trigger.
+const MODE = {
+  FULL: { label: 'Full pass', prop: 'CRAWL', inflightProp: 'INFLIGHT_FULL', continueHandler: 'continueMirror' },
+  TEST: { label: 'Test pass', prop: 'TEST_CRAWL', inflightProp: 'INFLIGHT_TEST', continueHandler: 'continueTestCourse' },
+};
 const PROP = {
-  CRAWL: 'CRAWL',
   STATE_ID: 'STATE_FILE_ID',
-  INFLIGHT: 'INFLIGHT_FILE_ID',
   LAST_DONE: 'LAST_COMPLETED_PASS',
 };
 const STREAMS = ['materials', 'courseWork', 'announcements'];
@@ -74,24 +77,35 @@ const LOG_HEADER = 'time,action,course,subfolder,file,source_id,details';
 // ========================== PUBLIC FUNCTIONS ==========================
 
 function mirrorClassroom() {
-  run_('');
+  run_(MODE.FULL, false);
 }
 
 function continueMirror() {
-  run_('');
+  run_(MODE.FULL, false);
 }
 
+// Test pass for one course. It uses its own cursor and its own continuation
+// trigger, never installs the hourly trigger, and never touches a full pass
+// that's in progress. It shares state.json and the tags with the full mirror
+// on purpose: files it copies are real, and the full pass recognises them
+// instead of copying them again.
 function testOneCourse() {
   const id = String(CONFIG.TEST_COURSE_ID || '').trim();
   if (!id) {
     throw new Error('Set CONFIG.TEST_COURSE_ID at the top of Code.gs first (run listMyCourses() to find it).');
   }
-  run_(id);
+  run_(MODE.TEST, true);
+}
+
+function continueTestCourse() {
+  run_(MODE.TEST, false);
 }
 
 function setup() {
   withLock_(function () {
-    removeTriggers();
+    ScriptApp.getProjectTriggers().forEach(function (t) {
+      if (t.getHandlerFunction() === HANDLER_HOURLY) ScriptApp.deleteTrigger(t);
+    });
     ScriptApp.newTrigger(HANDLER_HOURLY).timeBased().everyHours(1).create();
     const ctx = openContext_();
     ctx.log('SETUP', '', '', '', '', 'Hourly trigger created');
@@ -101,10 +115,10 @@ function setup() {
 }
 
 function removeTriggers() {
+  const ours = [HANDLER_HOURLY, MODE.FULL.continueHandler, MODE.TEST.continueHandler];
   let n = 0;
   ScriptApp.getProjectTriggers().forEach(function (t) {
-    const h = t.getHandlerFunction();
-    if (h === HANDLER_HOURLY || h === HANDLER_CONTINUE) {
+    if (ours.indexOf(t.getHandlerFunction()) >= 0) {
       ScriptApp.deleteTrigger(t);
       n++;
     }
@@ -122,17 +136,18 @@ function listMyCourses() {
 
 function showStatus() {
   const props = PropertiesService.getScriptProperties();
-  console.log('Last completed pass: ' + (props.getProperty(PROP.LAST_DONE) || 'never'));
-  const crawl = loadCrawl_();
-  if (crawl) {
+  console.log('Last completed full pass: ' + (props.getProperty(PROP.LAST_DONE) || 'never'));
+  [MODE.FULL, MODE.TEST].forEach(function (mode) {
+    const crawl = loadCrawl_(mode);
+    if (!crawl) {
+      console.log(mode.label + ': not in progress.');
+      return;
+    }
     const ci = crawl.courseIds.indexOf(crawl.pos.courseId);
-    console.log('Pass in progress since ' + crawl.startedAt +
-      (crawl.only ? ' (test course ' + crawl.only + ')' : '') +
-      ': course ' + (ci + 1) + ' of ' + crawl.courseIds.length +
+    console.log(mode.label + ': in progress since ' + crawl.startedAt +
+      ', course ' + (ci + 1) + ' of ' + crawl.courseIds.length +
       ', stream ' + (STREAMS[crawl.pos.stream] || '-'));
-  } else {
-    console.log('No pass in progress.');
-  }
+  });
   const triggers = ScriptApp.getProjectTriggers().map(function (t) { return t.getHandlerFunction(); });
   console.log('Triggers: ' + (triggers.length ? triggers.join(', ') : 'none'));
 }
@@ -140,8 +155,10 @@ function showStatus() {
 function resetState() {
   withLock_(function () {
     const props = PropertiesService.getScriptProperties();
-    props.deleteProperty(PROP.CRAWL);
-    props.deleteProperty(PROP.INFLIGHT);
+    props.deleteProperty(MODE.FULL.prop);
+    props.deleteProperty(MODE.TEST.prop);
+    props.deleteProperty(MODE.FULL.inflightProp);
+    props.deleteProperty(MODE.TEST.inflightProp);
     const ctx = openContext_();
     ctx.state = blankState_();
     ctx.dirty = true;
@@ -153,7 +170,8 @@ function resetState() {
 
 // ============================== RUNNER ==============================
 
-function run_(onlyCourseId) {
+// mode: MODE.FULL or MODE.TEST. fresh: start a new pass instead of resuming.
+function run_(mode, fresh) {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(10 * 1000)) {
     console.log('Another mirror run is still active; exiting.');
@@ -163,15 +181,25 @@ function run_(onlyCourseId) {
   let ctx = null;
   let crawl = null;
   try {
-    // At most one continuation trigger exists: remove old ones (fired or not),
-    // then arm a safety net that fires after this run's hard 6-minute limit.
-    deleteContinuations_();
-    scheduleContinuation_(CONFIG.SAFETY_CONTINUE_MS);
+    // At most one continuation trigger per mode: remove old ones (fired or
+    // not), then arm a safety net that fires after this run's hard 6-minute
+    // limit in case Apps Script kills it.
+    deleteContinuations_(mode);
+    scheduleContinuation_(mode, CONFIG.SAFETY_CONTINUE_MS);
 
     ctx = openContext_();
-    crawl = onlyCourseId ? null : loadCrawl_();
+    ctx.inflightProp = mode.inflightProp;
+    crawl = fresh ? null : loadCrawl_(mode);
     if (crawl && crawl.cleanExit === false) crawl = handleKilledRun_(ctx, crawl);
-    if (!crawl) crawl = newCrawl_(onlyCourseId);
+    if (!crawl) {
+      if (mode === MODE.TEST && !fresh) {
+        // A leftover test continuation with nothing to continue.
+        deleteContinuations_(mode);
+        flush_(ctx, null);
+        return;
+      }
+      crawl = newCrawl_(mode);
+    }
     crawl.cleanExit = false;
     saveCrawl_(crawl);
 
@@ -179,17 +207,18 @@ function run_(onlyCourseId) {
 
     if (done) {
       flush_(ctx, null);
-      props.deleteProperty(PROP.CRAWL);
-      props.setProperty(PROP.LAST_DONE, new Date().toISOString());
-      deleteContinuations_();
-      console.log('Pass complete (' + ctx.actions + ' change(s) this run).');
+      props.deleteProperty(mode.prop);
+      if (mode === MODE.FULL) props.setProperty(PROP.LAST_DONE, new Date().toISOString());
+      deleteContinuations_(mode);
+      console.log(mode.label + ' complete (' + ctx.actions + ' change(s) this run).');
     } else {
       crawl.cleanExit = true;
       crawl.kills = 0;
+      crawl.killKey = '';
       crawl.errors = 0;
       flush_(ctx, crawl);
-      deleteContinuations_();
-      scheduleContinuation_(CONFIG.CONTINUE_DELAY_MS);
+      deleteContinuations_(mode);
+      scheduleContinuation_(mode, CONFIG.CONTINUE_DELAY_MS);
       console.log('Time budget used; continuing in about a minute (' + ctx.actions + ' change(s) this run).');
     }
   } catch (e) {
@@ -203,14 +232,14 @@ function run_(onlyCourseId) {
         crawl.cleanExit = true;
         crawl.errors = (crawl.errors || 0) + 1;
         if (crawl.errors >= CONFIG.MAX_FAILED_RUNS) {
-          props.deleteProperty(PROP.CRAWL);
-          deleteContinuations_();
+          props.deleteProperty(mode.prop);
+          deleteContinuations_(mode);
           console.error('Giving up on this pass; the next hourly run starts a fresh one.');
         } else {
           saveCrawl_(crawl); // the safety-net continuation retries it
         }
       } else {
-        deleteContinuations_(); // failed before a pass existed: don't loop every few minutes
+        deleteContinuations_(mode); // failed before a pass existed: don't loop every few minutes
       }
     } catch (inner) {
       console.error('Cleanup after failure also failed: ' + inner);
@@ -231,54 +260,71 @@ function withLock_(fn) {
   }
 }
 
-// The previous run ended without a clean exit: Apps Script killed it at the
-// 6-minute limit. Retry, but if it keeps dying on the same file, skip that file.
+// The previous run ended without a clean exit, so Apps Script killed it at the
+// 6-minute limit. Only kills at the SAME spot count toward giving up:
+// - dying twice while copying the same file puts that file on a temporary
+//   skip list (CONFIG.KILL_SKIP_DAYS; cleared sooner if the file changes);
+// - dying twice at the same cursor outside a copy abandons this pass only.
+// Ordinary errors are caught, never reach this function, and never skip a file.
 function handleKilledRun_(ctx, crawl) {
   const props = PropertiesService.getScriptProperties();
-  crawl.kills = (crawl.kills || 0) + 1;
-  const inflight = props.getProperty(PROP.INFLIGHT) || '';
-  ctx.log('WARNING', '', '', '', inflight, 'Previous run hit the time limit (' + crawl.kills + ' in a row)');
+  const parts = (props.getProperty(ctx.inflightProp) || '').split('|');
+  const inflight = parts[0];
+  const inflightRev = parts.slice(1).join('|');
+  props.deleteProperty(ctx.inflightProp);
+  const killKey = inflight ? 'file:' + inflight : 'pos:' + JSON.stringify(crawl.pos);
+  crawl.kills = crawl.killKey === killKey ? (crawl.kills || 0) + 1 : 1;
+  crawl.killKey = killKey;
+  ctx.log('WARNING', '', '', '', inflight, 'Previous run hit the time limit ' +
+    (inflight ? 'while copying this file' : 'between files') + ' (' + crawl.kills + 'x at the same spot)');
   if (crawl.kills < CONFIG.MAX_HARD_KILLS) return crawl;
-  props.deleteProperty(PROP.INFLIGHT);
+
+  crawl.kills = 0;
+  crawl.killKey = '';
   if (inflight) {
-    ctx.state.poison[inflight] = new Date().toISOString();
+    ctx.state.poison[inflight] = {
+      until: new Date(Date.now() + CONFIG.KILL_SKIP_DAYS * 86400000).toISOString(),
+      rev: inflightRev,
+    };
     ctx.dirty = true;
-    crawl.kills = 0;
     return crawl;
   }
   ctx.log('ERROR', '', '', '', '', 'Abandoning this pass; the next hourly run starts over');
   return null;
 }
 
-function deleteContinuations_() {
+function deleteContinuations_(mode) {
   ScriptApp.getProjectTriggers().forEach(function (t) {
-    if (t.getHandlerFunction() === HANDLER_CONTINUE) ScriptApp.deleteTrigger(t);
+    if (t.getHandlerFunction() === mode.continueHandler) ScriptApp.deleteTrigger(t);
   });
 }
 
-function scheduleContinuation_(ms) {
-  ScriptApp.newTrigger(HANDLER_CONTINUE).timeBased().after(ms).create();
+function scheduleContinuation_(mode, ms) {
+  ScriptApp.newTrigger(mode.continueHandler).timeBased().after(ms).create();
 }
 
 // =============================== CRAWL ===============================
 // A "pass" walks every course -> stream -> page -> post -> attachment.
 // crawl.pos is the exact next attachment to process, saved with every flush.
 
-function newCrawl_(onlyCourseId) {
-  const ids = onlyCourseId ? [onlyCourseId] : listActiveCourses_().map(function (c) { return c.id; });
+function newCrawl_(mode) {
+  const ids = mode === MODE.TEST
+    ? [String(CONFIG.TEST_COURSE_ID).trim()]
+    : listActiveCourses_().map(function (c) { return c.id; });
   return {
+    prop: mode.prop,
     startedAt: new Date().toISOString(),
-    only: onlyCourseId || '',
     courseIds: ids,
     pos: { courseId: ids[0] || '', stream: 0, pageToken: '', postId: '', att: 0 },
     kills: 0,
+    killKey: '',
     errors: 0,
     cleanExit: true,
   };
 }
 
-function loadCrawl_() {
-  const raw = PropertiesService.getScriptProperties().getProperty(PROP.CRAWL);
+function loadCrawl_(mode) {
+  const raw = PropertiesService.getScriptProperties().getProperty(mode.prop);
   if (!raw) return null;
   try {
     return JSON.parse(raw);
@@ -288,7 +334,7 @@ function loadCrawl_() {
 }
 
 function saveCrawl_(crawl) {
-  PropertiesService.getScriptProperties().setProperty(PROP.CRAWL, JSON.stringify(crawl));
+  PropertiesService.getScriptProperties().setProperty(crawl.prop, JSON.stringify(crawl));
 }
 
 // Returns true when the pass is finished, false when the time budget ran out.
@@ -500,8 +546,15 @@ function processDriveFile_(ctx, cc, info, df) {
   }
   if (!meta) return skip_(ctx, cc, info, srcId, title, 'No access, or the file was deleted', null, '');
   if (meta.trashed) return skip_(ctx, cc, info, srcId, meta.name, 'File is in the owner\'s trash', null, '');
-  if (ctx.state.poison[srcId]) {
-    return skip_(ctx, cc, info, srcId, meta.name, 'Skipped: copying it repeatedly exceeded the time limit', openUrl, '');
+  const rev = meta.md5Checksum || meta.modifiedTime;
+  const poison = ctx.state.poison[srcId];
+  if (poison) {
+    if (poison.until > new Date().toISOString() && poison.rev === rev) {
+      return skip_(ctx, cc, info, srcId, meta.name, 'Temporarily skipped: copying it made the script time out twice; ' +
+        'will retry after ' + poison.until.slice(0, 10) + ' or when the file changes', openUrl, '');
+    }
+    delete ctx.state.poison[srcId]; // expired, or the file changed: try again
+    ctx.dirty = true;
   }
 
   const mime = meta.mimeType;
@@ -516,7 +569,6 @@ function processDriveFile_(ctx, cc, info, df) {
 
   const dest = destFolder_(ctx, cc, info);
   const key = srcId + '|' + dest.id; // one entry per source file per destination folder
-  const rev = meta.md5Checksum || meta.modifiedTime;
   const prev = ctx.state.files[key] || adoptExistingCopy_(ctx, key, srcId, dest.id);
   if (prev && prev.rev === rev) return; // mirrored and unchanged
 
@@ -527,17 +579,27 @@ function processDriveFile_(ctx, cc, info, df) {
   const name = uniqueName_(dest.id, wanted, null, false);
   const tags = { mirrorSrc: srcId, mirrorRev: rev };
 
+  if (isGoogle && ctx.conversionsBlocked) return; // daily conversion quota used up; next pass retries
+
+  // Remember which file is being copied, in case Apps Script kills the run mid-copy.
   const props = PropertiesService.getScriptProperties();
-  props.setProperty(PROP.INFLIGHT, srcId);
+  props.setProperty(ctx.inflightProp, srcId + '|' + rev);
   let created;
   try {
     created = isGoogle
-      ? createFromBlob_(DriveApp.getFileById(srcId).getAs('application/pdf'), name, 'application/pdf', dest.id, tags)
+      ? exportPdf_(srcId, name, dest.id, tags)
       : copyBinary_(srcId, name, mime, dest.id, tags, caps);
   } catch (e) {
+    if (isGoogle && isDailyQuota_(e)) {
+      ctx.conversionsBlocked = true;
+      ctx.log('WARNING', cc.label, '', meta.name, srcId,
+        'Daily Apps Script conversion quota reached; remaining PDF exports wait for a later pass');
+      return;
+    }
+    // Not recorded as mirrored, so the next pass tries again.
     return skip_(ctx, cc, info, srcId, meta.name, isGoogle ? 'PDF export failed' : 'Copy failed', openUrl, shortErr_(e));
   } finally {
-    props.deleteProperty(PROP.INFLIGHT);
+    props.deleteProperty(ctx.inflightProp);
   }
 
   ctx.state.files[key] = { rev: rev, name: created.name || name, copyId: created.id, at: new Date().toISOString() };
@@ -581,6 +643,16 @@ function adoptExistingCopy_(ctx, key, srcId, folderId) {
   ctx.state.files[key] = entry;
   ctx.dirty = true;
   return entry;
+}
+
+// The ONLY path that turns Google Docs/Sheets/Slides/Drawings into PDF:
+// Apps Script's File.getAs() conversion (a read, so drive.readonly suffices),
+// then an upload of the PDF via the Drive API (drive.file). getAs() counts
+// toward Apps Script's daily conversion quota. Any failure throws to the caller,
+// which logs it, links the file in links.md, and retries on the next pass.
+function exportPdf_(srcId, name, folderId, tags) {
+  const pdf = DriveApp.getFileById(srcId).getAs('application/pdf');
+  return createFromBlob_(pdf, name, 'application/pdf', folderId, tags);
 }
 
 function copyBinary_(srcId, name, mime, folderId, tags, caps) {
@@ -711,6 +783,8 @@ function openContext_() {
     logRows: [],
     links: {},
     courses: {},
+    inflightProp: MODE.FULL.inflightProp,
+    conversionsBlocked: false,
   };
   ctx.log = function (action, course, folder, file, srcId, detail) {
     const row = [Utilities.formatDate(new Date(), ctx.tz, 'yyyy-MM-dd HH:mm:ss'), action, course, folder, file, srcId, detail];
@@ -904,6 +978,11 @@ function esc_(s) {
   return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 }
 
+// "Service invoked too many times for one day: ..." won't clear until tomorrow.
+function isDailyQuota_(e) {
+  return /for one day|daily/i.test(String((e && e.message) || e));
+}
+
 function isNotFound_(e) {
   return /not ?found|404|could not be found|no item with the given id/i.test(String((e && e.message) || e));
 }
@@ -918,7 +997,7 @@ function retry_(fn) {
     } catch (e) {
       const msg = String((e && e.message) || e);
       const transient = /rate ?limit|too many|429|500|502|503|backend error|internal error|timed? ?out|try again|temporar/i.test(msg) &&
-        !/storage quota/i.test(msg);
+        !/storage quota/i.test(msg) && !isDailyQuota_(e);
       if (!transient || attempt >= 3) throw e;
       Utilities.sleep(1000 * Math.pow(2, attempt) + Math.floor(Math.random() * 500));
     }
