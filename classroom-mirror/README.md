@@ -60,8 +60,10 @@ Classroom Mirror/
 **Caveats:**
 - `Drive.Files.copy` with this scope pair can't be confirmed until you run it. If
   Google refuses the copy, `copyBinary_` downloads the file (read) and uploads it
-  (create) instead. That fallback works for files up to Apps Script's ~50 MB blob
-  limit.
+  (create) instead. No size limit is assumed for that upload. If it fails
+  (because of size or any other API limit), the log says which step failed, the
+  original link goes into `links.md`, and the attachment is **not** marked as
+  mirrored, so the next pass tries again.
 - If authorization fails with *"Required permissions:
   https://www.googleapis.com/auth/drive"*, replace the `drive.readonly` and
   `drive.file` lines with `"https://www.googleapis.com/auth/drive"` and authorize

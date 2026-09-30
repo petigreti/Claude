@@ -655,7 +655,13 @@ function exportPdf_(srcId, name, folderId, tags) {
   return createFromBlob_(pdf, name, 'application/pdf', folderId, tags);
 }
 
+// Server-side copy first. If Google refuses it, download the file and upload
+// it with Drive.Files.create. No size limit is assumed for that fallback: if it
+// fails (too large, or any other API limit), the error is thrown to the
+// caller, which logs which step failed, links the original in links.md, and
+// leaves the attachment unmarked so the next pass tries again.
 function copyBinary_(srcId, name, mime, folderId, tags, caps) {
+  let copyErr = null;
   if (caps.canCopy !== false) {
     try {
       return retry_(function () {
@@ -663,10 +669,15 @@ function copyBinary_(srcId, name, mime, folderId, tags, caps) {
       });
     } catch (e) {
       if (caps.canDownload === false) throw e;
-      // Fall back to download + upload below.
+      copyErr = e;
     }
   }
-  return createFromBlob_(DriveApp.getFileById(srcId).getBlob(), name, mime, folderId, tags);
+  try {
+    return createFromBlob_(DriveApp.getFileById(srcId).getBlob(), name, mime, folderId, tags);
+  } catch (e) {
+    throw new Error((copyErr ? 'Direct copy failed (' + shortErr_(copyErr) + '); ' : '') +
+      'download+upload fallback failed: ' + shortErr_(e));
+  }
 }
 
 function createFromBlob_(blob, name, mime, folderId, tags) {

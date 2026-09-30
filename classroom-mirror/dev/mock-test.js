@@ -357,6 +357,25 @@ test('daily conversion quota: exports wait, nothing is marked done, later pass s
   assert.strictEqual(copies(w).filter((f) => /Lecture 1\.pdf/.test(f.name)).length, 2);
 });
 
+test('copy refused AND fallback upload fails -> logged, linked, retried next pass', () => {
+  const w = makeWorld(); seed(w);
+  const realCreate = w.g.Drive.Files.create;
+  let failUploads = true;
+  w.failNextCopy = true;
+  w.g.Drive.Files.create = function (res, blob) {
+    if (failUploads && blob && res.name === 'Syllabus Fall 2026.pdf') throw new Error('Request too large');
+    return realCreate.apply(this, arguments);
+  };
+  drain(w);
+  const log = byName(w, 'mirror-log.csv').content;
+  assert(/Copy failed — Direct copy failed .*download\+upload fallback failed: Request too large/.test(log), log);
+  assert(byName(w, 'links.md').content.includes('Syllabus: Fall/2026.pdf'));
+  const before = copies(w).length;
+  failUploads = false;
+  drain(w);
+  assert(copies(w).length > before, 'retried on the next pass');
+});
+
 test('copy refused -> download+upload fallback; unreadable export -> link', () => {
   const w = makeWorld(); seed(w);
   w.failNextCopy = true;
